@@ -1,5 +1,4 @@
 const { chromium } = require('playwright');
-const { path: ghostPath } = require('ghost-cursor');
 const fs = require('fs');
 const path = require('path');
 
@@ -66,11 +65,29 @@ async function waitForScene(page, scene) {
   }
 }
 
+// options.during(at): optional actions (hovers, clicks) to run while the clip plays, so the screen isn't static.
+// at(f) waits until fraction f of the cue (0-1), e.g. `async (at) => { await cursor.move(a); await at(0.6); await cursor.move(b); }`.
+// A failed action is logged and the cue still runs to its full length.
 async function runCue(page, timings, cueId, options = {}) {
   await waitForScene(page, options.scene);
   const event = {cue_id: cueId, file: timings[cueId]?.file || null, start_sec: syncNow(), scene: options.scene || null};
   syncEvents.push(event);
-  await page.waitForTimeout(waitDuration(timings, cueId, options.settleSec ?? 0.35));
+  const t0 = Date.now();
+  const total = waitDuration(timings, cueId, options.settleSec ?? 0.35);
+  const at = async (f) => {
+    const wait = t0 + f * total - Date.now();
+    if (wait > 0) {
+      await page.waitForTimeout(wait);
+    }
+  };
+  if (options.during) {
+    try {
+      await options.during(at);
+    } catch (error) {
+      console.warn(`[${cueId}] action failed: ${error.message.split('\n')[0]}`);
+    }
+  }
+  await at(1);
   event.end_sec = syncNow();
 }
 
@@ -168,8 +185,34 @@ async function smoothScrollTo(page, target) {
   await page.waitForTimeout(650);
 }
 
+// Human-like pointer, tuned against cursor tracks from a hand-recorded screen capture:
+// fast launch and long deceleration (speed peaks ~40% in), a slight arc, a primary move that lands a little
+// short of where it's aiming, then one small correction. It aims off-center on the target and holds still once there.
+const rand = (a, b) => a + Math.random() * (b - a);
+// Minimum-jerk position profile with time warped so peak speed comes early (~0.4 instead of 0.5).
+const ease = (t) => { const u = Math.pow(t, 0.8); return 10 * u ** 3 - 15 * u ** 4 + 6 * u ** 5; };
+
 function createPlaywrightCursor(page) {
-  let currentPoint = { x: 0, y: 0 };
+  let currentPoint = { x: viewport.width / 2, y: viewport.height / 2 };
+
+  async function stroke(to, durationSec, bowFrac) {
+    const from = currentPoint;
+    const dx = to.x - from.x, dy = to.y - from.y, dist = Math.hypot(dx, dy) || 1;
+    // Quadratic Bezier with its control point pushed sideways -> gentle wrist arc.
+    const side = bowFrac * dist;
+    const ctrl = { x: (from.x + to.x) / 2 - dy / dist * side, y: (from.y + to.y) / 2 + dx / dist * side };
+    const t0 = Date.now(), ms = durationSec * 1000;
+    for (;;) {
+      const t = Math.min(1, (Date.now() - t0) / ms), s = ease(t);
+      const x = (1 - s) ** 2 * from.x + 2 * (1 - s) * s * ctrl.x + s * s * to.x;
+      const y = (1 - s) ** 2 * from.y + 2 * (1 - s) * s * ctrl.y + s * s * to.y;
+      await page.mouse.move(x, y);
+      if (t >= 1) break;
+      await page.waitForTimeout(16);
+    }
+    currentPoint = to;
+  }
+
   return {
     async move(target) {
       await smoothScrollTo(page, target);
@@ -177,18 +220,32 @@ function createPlaywrightCursor(page) {
       if (!box) {
         throw new Error('Unable to resolve the target bounding box');
       }
-      const destination = {
-        x: box.x + (box.width / 2),
-        y: box.y + (box.height / 2),
+      // Where the eye is aiming: toward the start of the label, never dead center.
+      const aim = {
+        x: box.x + Math.min(box.width * rand(0.15, 0.6), rand(20, 140)),
+        y: box.y + box.height * rand(0.35, 0.75),
       };
-      for (const point of ghostPath(currentPoint, destination)) {
-        await page.mouse.move(point.x, point.y);
+      const dx = aim.x - currentPoint.x, dy = aim.y - currentPoint.y, dist = Math.hypot(dx, dy);
+      if (dist < 4) return;
+      await page.waitForTimeout(rand(60, 180)); // reaction time before the hand moves
+      const duration = (0.12 + 0.085 * Math.log2(1 + dist / 30)) * rand(0.85, 1.2);
+      const bow = rand(0.03, 0.12) * (Math.random() < 0.5 ? -1 : 1);
+      if (dist < 70) {
+        await stroke(aim, duration, bow);
+        return;
       }
-      currentPoint = destination;
+      // Primary ballistic move lands short and a little off-line, then a quick corrective nudge.
+      const under = Math.min(40, dist * rand(0.03, 0.09)), off = Math.max(-18, Math.min(18, dist * rand(-0.035, 0.035)));
+      const ux = dx / dist, uy = dy / dist;
+      await stroke({ x: aim.x - ux * under - uy * off, y: aim.y - uy * under + ux * off }, duration, bow);
+      await page.waitForTimeout(rand(70, 200));
+      await stroke(aim, rand(0.1, 0.18), rand(-0.08, 0.08));
     },
     async click(target) {
       await this.move(target);
+      await page.waitForTimeout(rand(90, 200));
       await page.mouse.down();
+      await page.waitForTimeout(rand(60, 110));
       await page.mouse.up();
     },
   };
@@ -219,18 +276,29 @@ async function runProductWorkflow(page, timings, cursor) {
 async function runDemo() {
   const timings = readTimings();
   fs.mkdirSync(recordingsDir, { recursive: true });
-  const browser = await chromium.launch({
+  const launchOptions = {
     headless: process.env.DEMO_HEADLESS === '1',
     args: ['--force-device-scale-factor=1'],
-  });
-  const context = await browser.newContext({
+  };
+  const contextOptions = {
     viewport,
     recordVideo: {
       dir: recordingsDir,
       size: recordingSize,
     },
-  });
+  };
+  // DEMO_USER_DATA_DIR reuses a persistent Chromium profile, so a sign-in done once (by hand, in that
+  // profile) carries into the recording. Close any other browser using the profile first; it is locked while open.
+  const userDataDir = process.env.DEMO_USER_DATA_DIR;
+  const browser = userDataDir ? null : await chromium.launch(launchOptions);
+  const context = userDataDir
+    ? await chromium.launchPersistentContext(path.resolve(userDataDir), {...launchOptions, ...contextOptions})
+    : await browser.newContext(contextOptions);
+  const startupPages = context.pages();
   const page = await context.newPage();
+  for (const startupPage of startupPages) {
+    await startupPage.close();
+  }
   syncClockMs = Date.now();
   const video = page.video();
   const cursor = createPlaywrightCursor(page);
@@ -244,7 +312,7 @@ async function runDemo() {
   } finally {
     writeSyncManifest();
     await context.close();
-    await browser.close();
+    await browser?.close();
   }
 
   if (video) {
