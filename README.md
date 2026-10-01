@@ -76,8 +76,9 @@ The pipeline behind a single request. You can read this to know what the agent i
 | --- | --- |
 | 1. Draft cues | Reads the running app, picks the scenes worth showing, and writes one narration sentence per scene. |
 | 2. Synthesize | Generates each sentence in your cloned voice. Happens *before* recording, so the recorder knows how long each clip runs. |
+| 2b. Pace | Lengthens the pauses and slows the delivery slightly, so the narration doesn't sound rushed. |
 | 3. Write the workflow | Copies the recorder template and fills in your app's real navigation and selectors, pairing every cue with the scene it should wait for. |
-| 4. Record | Drives a real Chromium window, with a visible cursor and click effects, and records when each cue actually started and ended. |
+| 4. Record | Drives a real Chromium window, with a cursor that moves like a hand and click effects. It hovers over what each line is about while the line plays, and records when each cue actually started and ended. |
 | 5. Sync | Lines the narration up with what was recorded, inserting silence over browser transitions so a sentence never starts over a loading screen. |
 | 6. Mux and verify | Produces a 1920x1080 H.264/AAC MP4 and checks it is real. |
 
@@ -108,6 +109,9 @@ cd "$APP"
   --cues output/cues.json \
   --ref-audio "$SKILL/assets/reference_voice.wav"
 
+# 2b. pace it: longer pauses, slightly slower; keeps the raw clips in output/audio_raw
+"$PY" "$SKILL/scripts/pace_audio.py"
+
 # 3. record. Needs DEMO_URL and a customized output/run_demo.js.
 DEMO_URL="http://localhost:3000" node output/run_demo.js
 
@@ -130,8 +134,10 @@ Set these in the target app's environment before asking for a demo. The agent ha
 | `DEMO_HEADLESS` | `0` | Set to `1` to hide the browser window. |
 | `DEMO_VIEWPORT_WIDTH` | `2000` | Page width. Override for very wide layouts. |
 | `DEMO_VIEWPORT_HEIGHT` | `1125` | Page height. |
+| `DEMO_USER_DATA_DIR` | — | Persistent Chromium profile to record in. Sign in to the app once in that profile, and the recording reuses the session. |
 | `DEMO_ACTIONS` | — | JSON clicks (`{selector, cue, waitForBefore, waitForAfter}`) if you'd rather not let the agent edit the template. |
 | `SYNC_MANIFEST` | `output/sync_manifest.json` | Override the sync manifest path. |
+| `PYTHON` | auto | Python used by `mux.sh`. It defaults to the first of `python3` and `python` that works. |
 
 The page is recorded at 2000x1125 so wide layouts don't clip at the right edge, then scaled to 1920x1080 in the final file.
 
@@ -166,6 +172,10 @@ ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 ou
 ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 output/final_demo.mp4
 ```
 
+**The narration sounds rushed** — run `scripts/pace_audio.py` (step 2b). For more room, use `--long-extra 0.6` or `--tempo 0.9`.
+
+**`No working python3 or python found` on Windows** — `mux.sh` needs a Python on `PATH`. Set `PYTHON` to the skill venv's `python.exe`.
+
 **`externally-managed-environment`** — something installed into system Python. Use `scripts/setup_env.sh`; it makes its own venv.
 
 **Torch import errors, or `backcompat`** — the Python is too new. Install 3.12, delete the venv, and rerun `scripts/setup_env.sh`.
@@ -186,7 +196,8 @@ ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 ou
 | `.claude/skills/record-demo.md` | Entry point for when you work inside this repo. Points at `SKILL.md`. |
 | `scripts/setup_env.sh` | Creates the Python environment and installs Node dependencies |
 | `scripts/voice_clone.py` | Generates narration audio and timing manifests with Qwen3-TTS |
-| `scripts/run_demo_template.js` | Recorder template with synthetic cursor, click effects, and cue timing |
+| `scripts/pace_audio.py` | Lengthens pauses and slows the narration, keeping the raw TTS clips |
+| `scripts/run_demo_template.js` | Recorder template with a human-like cursor, click effects, and cue timing |
 | `scripts/mux.sh` | Aligns narration with the recording and muxes the final MP4 |
 | `output/` | Everything generated. Ignored by Git. |
 | `assets/reference_voice.wav` | Your voice sample. Ignored by Git. |
@@ -198,9 +209,10 @@ npm ci
 npm run lint
 npm run typecheck
 npm test
+.venv/bin/python tests/test_pace_audio.py   # Windows: .venv/Scripts/python
 ```
 
-These validate the recorder template's syntax only. There is no end-to-end test target in the repo.
+The npm scripts validate the recorder template's syntax only. `test_pace_audio.py` checks the pause stretching. There is no end-to-end test target in the repo.
 
 ## Before you share this
 

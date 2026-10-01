@@ -11,6 +11,16 @@ SYNC_MANIFEST="${SYNC_MANIFEST:-$AUDIO_DIR/../sync_manifest.json}"
 SYNC_AUDIO_LIST="$AUDIO_DIR/sync_audio_list.txt"
 TRIM_START=0
 
+# Windows usually has `python` but no working `python3` (or only the Store stub), so probe instead of assuming.
+if [[ -z "${PYTHON:-}" ]]; then
+  for candidate in python3 python; do
+    if "$candidate" -c 'import wave' >/dev/null 2>&1; then
+      PYTHON="$candidate"
+      break
+    fi
+  done
+fi
+
 mkdir -p "$(dirname "$MASTER_AUDIO")" "$(dirname "$FINAL_OUTPUT")"
 rm -f "$SYNC_AUDIO_LIST" "$AUDIO_DIR/sync_trim_start.txt"
 
@@ -20,7 +30,7 @@ if [[ ! -f "$CONCAT_FILE" ]]; then
 fi
 
 if [[ -f "$SYNC_MANIFEST" ]]; then
-  python3 - "$SYNC_MANIFEST" "$AUDIO_DIR" "$SYNC_AUDIO_LIST" <<'PY'
+  "${PYTHON:?No working python3 or python found; set PYTHON}" - "$SYNC_MANIFEST" "$AUDIO_DIR" "$SYNC_AUDIO_LIST" <<'PY'
 import json
 import sys
 import wave
@@ -52,7 +62,10 @@ for index, event in enumerate(events):
             target.writeframes(b'\0' * int(gap * rate) * channels * width)
         files.append(silence)
     files.append(Path(event['file']))
-    cursor = max(cursor, float(event.get('end_sec', start)))
+    # Advance by the clip's real length, not end_sec: the recorder holds each scene a little past the clip,
+    # and that hold must become silence before the next cue or every later clip starts early (drift accumulates).
+    with wave.open(event['file'], 'rb') as clip:
+        cursor = max(cursor, start + clip.getnframes() / clip.getframerate())
 
 with list_path.open('w', encoding='utf-8') as handle:
     for file_path in files:
